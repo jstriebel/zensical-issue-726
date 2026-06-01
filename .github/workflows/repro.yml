@@ -10,20 +10,16 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - name: Build docs-delay shim
+      - name: Trace openat syscalls for docs dir
+        run: |
+          strace -f -e trace=openat -o /tmp/strace.txt \
+            uvx zensical==0.0.43 build 2>/dev/null || true
+          echo "=== openat calls mentioning 'docs' ==="
+          grep '".*docs' /tmp/strace.txt | head -20 || echo "(none)"
+
+      - name: Build docs-delay shim (log all docs-related opens)
         run: |
           cat > /tmp/delay_docs.c << 'EOF'
-          /*
-           * Intercept file-open calls and sleep 2 s the first time the process
-           * opens the docs/ directory of the current project.  This widens the
-           * race window in zensical 0.0.43 (docs dir watched last) enough to
-           * guarantee the scheduler idle-timeout fires before any markdown file
-           * is inserted, so site/index.html is never generated.
-           *
-           * Uses the absolute CWD/docs path (set in the constructor) so that
-           * opens of unrelated "docs" dirs during uvx package installation do
-           * not trigger the delay prematurely.
-           */
           #define _GNU_SOURCE
           #include <dlfcn.h>
           #include <dirent.h>
@@ -45,8 +41,11 @@ jobs:
           }
 
           static void maybe_delay(const char *path) {
-              if (!path || fired || !target[0]) return;
-              if (strcmp(path, target) == 0) {
+              if (!path || !target[0]) return;
+              /* log every open containing "docs" so we can see what paths arrive */
+              if (strstr(path, "docs"))
+                  fprintf(stderr, "[delay_docs] saw: %s (fired=%d)\n", path, fired);
+              if (!fired && strcmp(path, target) == 0) {
                   fired = 1;
                   fprintf(stderr, "[delay_docs] 2s delay before docs scan\n");
                   struct timespec ts = {2, 0};
