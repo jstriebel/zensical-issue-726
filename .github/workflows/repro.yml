@@ -11,7 +11,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
 
       - name: Generate dummy files to widen race window
-        run: python3 -c "for i in range(50_000): open(f'dummy_{i:06d}.txt', 'w').write('x')"
+        run: python3 -c "[open('dummy_%06d.txt' % i, 'w').write('x') for i in range(50000)]"
 
       - name: Build site
         run: uvx zensical==0.0.43 build
