@@ -33,6 +33,7 @@ jobs:
           #include <sys/user.h>
           #include <sys/wait.h>
           #include <unistd.h>
+          #include <errno.h>
 
           /* Read a NUL-terminated string from another process's address space */
           static void read_str(pid_t pid, unsigned long addr, char *buf, size_t len) {
