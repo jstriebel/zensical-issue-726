@@ -1,43 +1,29 @@
 # zensical/zensical#726 — reproduction
 
+[![Reproduce](https://github.com/jstriebel/zensical-issue-726/actions/workflows/repro.yml/badge.svg)](https://github.com/jstriebel/zensical-issue-726/actions/workflows/repro.yml)
+
 Minimal reproduction for [zensical/zensical#726](https://github.com/zensical/zensical/issues/726),
 fixed in [zensical/zensical#727](https://github.com/zensical/zensical/pull/727).
 
-The [CI action](../../actions) builds a patched zensical 0.0.43, runs it against
-this project, and asserts that `site/index.html` is generated.  The assertion
-fails: the race causes either a `RuntimeError: Watcher disconnected` (the
-scheduler session closes while docs files are being inserted) or a silent empty
-`site/` depending on timing.
-
 ## Root cause
 
-`Watcher::new` in `crates/zensical/src/watcher.rs` registers the docs directory
-with the file agent **last**, after config and theme directories.  The agent
-scans directories asynchronously; by the time the docs directory is scanned the
-scheduler has already processed the config file, gone empty, and exited — so no
-markdown files are ever inserted, the barrier never fires, and no HTML is
-rendered.
-
-Fix: watch docs **first** so markdown files enter the scheduler before
-config/theme files, keeping the build loop alive long enough for the barrier to
-collect all pages.
-
-## How the reproduction works
-
-`race.patch` inserts a `thread::sleep(2s)` in 0.0.43's `Watcher::new`, right
-before `agent.watch(docs_dir)`.  The sleep gives the scheduler time to drain the
-config and theme events and exit before docs files are registered — making the
-race that occurs naturally on fast multi-core machines deterministic on any
-runner.
+`Watcher::new` registers the docs directory with the file agent last; the
+scheduler can drain and exit before any docs files arrive, so no HTML is
+rendered.  See [#726](https://github.com/zensical/zensical/issues/726) for details.
 
 ## Reproduce locally
+
+This is a timing race — running `uvx zensical==0.0.43 build` fails consistently
+on the reporter's machine.  `race.patch` surfaces it on machines where the race
+doesn't trigger naturally (fewer cores, different architecture) by inserting a
+`thread::sleep(2s)` in `Watcher::new` right before `agent.watch(docs_dir)`,
+giving the scheduler time to drain and exit before docs files are registered.
 
 ```sh
 uvx zensical==0.0.43 build
 ```
 
-On a fast (≥8-core) machine this fails reliably.  On a slower machine apply
-the patch manually:
+To reproduce with the patch:
 
 ```sh
 # Note: python/zensical/templates/ is not committed to git (it is a build
