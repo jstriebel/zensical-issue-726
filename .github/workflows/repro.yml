@@ -8,141 +8,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v5
-
-      - name: Build ptrace delay injector
+      - name: Clone zensical 0.0.43
         run: |
-          cat > /tmp/inject_delay.c << 'EOF'
-          /*
-           * inject_delay: fork a child, trace it with ptrace, and sleep
-           * <secs> seconds the first time it makes an openat(2) syscall
-           * with <path> as the filename argument.
-           *
-           * Usage: inject_delay <path> <secs> <cmd> [args...]
-           *
-           * Rust (via rustix) calls openat2 as a raw syscall, bypassing
-           * glibc, so LD_PRELOAD cannot intercept it.  ptrace works at
-           * the kernel boundary and catches raw syscalls too.
-           */
-          /*
-           * inject_delay: fork a child, trace it with ptrace, and sleep
-           * <secs> seconds when any thread calls inotify_add_watch(2) with
-           * <path> as the watch target.
-           *
-           * Usage: inject_delay <path> <secs> <cmd> [args...]
-           *
-           * We intercept inotify_add_watch (syscall 254) rather than openat
-           * so that the delay fires before the file agent registers the docs
-           * directory at all.  With openat-interception the scheduler already
-           * knows a watch is pending and waits; with inotify_add_watch-
-           * interception the scheduler never learns about docs until after it
-           * has gone idle and exited — exactly replicating the race.
-           */
-          #define _GNU_SOURCE
-          #include <errno.h>
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <sys/ptrace.h>
-          #include <sys/syscall.h>
-          #include <sys/user.h>
-          #include <sys/wait.h>
-          #include <unistd.h>
+          git clone https://github.com/zensical/zensical \
+            --branch v0.0.43 --depth 1 zensical-src
 
-          #ifndef SYS_inotify_add_watch
-          #define SYS_inotify_add_watch 254
-          #endif
+      - name: Apply race-determinism patch
+        run: patch -p1 -d zensical-src < race.patch
 
-          /* Read a NUL-terminated string from another process's address space */
-          static void read_str(pid_t pid, unsigned long addr, char *buf, size_t len) {
-              union { long v; char b[sizeof(long)]; } u;
-              for (size_t i = 0; i < len - 1; i += sizeof(long)) {
-                  u.v = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr + i), NULL);
-                  for (size_t j = 0; j < sizeof(long) && i + j < len - 1; j++) {
-                      buf[i + j] = u.b[j];
-                      if (!u.b[j]) return;
-                  }
-              }
-              buf[len - 1] = '\0';
-          }
+      - uses: dtolnay/rust-toolchain@stable
 
-          int main(int argc, char **argv) {
-              if (argc < 4) {
-                  fprintf(stderr, "usage: %s path secs cmd [args...]\n", argv[0]);
-                  return 1;
-              }
-              const char *target = argv[1];
-              int secs = atoi(argv[2]);
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: zensical-src
 
-              pid_t root = fork();
-              if (root == 0) {
-                  ptrace(PTRACE_TRACEME, 0, NULL, NULL);
-                  raise(SIGSTOP);
-                  execvp(argv[3], argv + 3);
-                  perror(argv[3]);
-                  _exit(127);
-              }
+      - name: Build patched zensical
+        run: cargo build --release
+        working-directory: zensical-src
 
-              int st;
-              waitpid(root, &st, 0);
-              ptrace(PTRACE_SETOPTIONS, root, NULL,
-                     PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE |
-                     PTRACE_O_TRACEFORK   | PTRACE_O_TRACEVFORK);
-              ptrace(PTRACE_SYSCALL, root, NULL, NULL);
-
-              for (;;) {
-                  pid_t pid = waitpid(-1, &st, __WALL);
-                  if (pid < 0) break;
-                  if (WIFEXITED(st)   && pid == root) return WEXITSTATUS(st);
-                  if (WIFSIGNALED(st) && pid == root) return 128 + WTERMSIG(st);
-                  if (!WIFSTOPPED(st)) continue;
-
-                  int sig = WSTOPSIG(st), fwd = 0;
-                  int ev  = st >> 16;
-
-                  if (ev == PTRACE_EVENT_FORK  ||
-                      ev == PTRACE_EVENT_VFORK ||
-                      ev == PTRACE_EVENT_CLONE) {
-                      /* resume new child from its initial ptrace-stop */
-                      unsigned long npid;
-                      ptrace(PTRACE_GETEVENTMSG, pid, NULL, &npid);
-                      ptrace(PTRACE_SYSCALL, (pid_t)npid, NULL, NULL);
-                  } else if (sig == (SIGTRAP | 0x80)) {
-                      /* syscall entry or exit — entry is identified by the
-                         kernel sentinel rax == -ENOSYS set before dispatch */
-                      struct user_regs_struct r;
-                      ptrace(PTRACE_GETREGS, pid, NULL, &r);
-                      if ((long long)r.orig_rax == SYS_inotify_add_watch &&
-                          r.rax == (unsigned long long)(long long)-ENOSYS) {
-                          /* inotify_add_watch(fd, pathname, mask):
-                             pathname is the second argument → rsi */
-                          char path[4096] = "";
-                          read_str(pid, r.rsi, path, sizeof path);
-                          if (!strcmp(path, target)) {
-                              fprintf(stderr,
-                                  "[inject_delay] %ds delay on inotify_add_watch"
-                                  " (tid %d)\n", secs, (int)pid);
-                              sleep(secs);
-                              fprintf(stderr, "[inject_delay] done (tid %d)\n",
-                                  (int)pid);
-                          }
-                      }
-                  } else if (sig != SIGTRAP) {
-                      fwd = sig;   /* pass real signals through to the tracee */
-                  }
-                  ptrace(PTRACE_SYSCALL, pid, NULL, (void *)(long)fwd);
-              }
-              return 0;
-          }
-          EOF
-          gcc -o /tmp/inject_delay /tmp/inject_delay.c
-          echo "injector compiled OK"
-
-      - name: Build site (docs scan delayed via ptrace injector)
-        run: /tmp/inject_delay "$(pwd)/docs" 2 uvx zensical==0.0.43 build
+      - name: Build site
+        run: ./zensical-src/target/release/zensical build
 
       - name: Assert site/index.html was generated
         run: |
           echo "site/ contents:"
           find site -type f | sort
-          test -f site/index.html || (echo "FAIL: site/index.html missing — bug reproduced" && exit 1)
+          test -f site/index.html || \
+            (echo "FAIL: site/index.html missing — bug reproduced" && exit 1)

@@ -1,0 +1,16 @@
+--- a/crates/zensical/src/watcher.rs
++++ b/crates/zensical/src/watcher.rs
+@@ -258,6 +258,13 @@
+         fs::create_dir_all(&site_dir).unwrap();
+         agent.watch(&site_dir)?;
+ 
++        // Sleep long enough for the scheduler to drain config+theme
++        // events and exit before the docs directory is registered.
++        // This makes the race deterministic; on fast multi-core machines
++        // the scheduler races ahead naturally without the sleep.
++        // Fixed in zensical/zensical#727 by watching docs first.
++        std::thread::sleep(std::time::Duration::from_secs(2));
++
+         // Return file watcher
+         agent.watch(config.get_docs_dir())?;
+         Ok(Self { agent })
