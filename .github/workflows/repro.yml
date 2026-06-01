@@ -24,7 +24,22 @@ jobs:
            * glibc, so LD_PRELOAD cannot intercept it.  ptrace works at
            * the kernel boundary and catches raw syscalls too.
            */
+          /*
+           * inject_delay: fork a child, trace it with ptrace, and sleep
+           * <secs> seconds when any thread calls inotify_add_watch(2) with
+           * <path> as the watch target.
+           *
+           * Usage: inject_delay <path> <secs> <cmd> [args...]
+           *
+           * We intercept inotify_add_watch (syscall 254) rather than openat
+           * so that the delay fires before the file agent registers the docs
+           * directory at all.  With openat-interception the scheduler already
+           * knows a watch is pending and waits; with inotify_add_watch-
+           * interception the scheduler never learns about docs until after it
+           * has gone idle and exited — exactly replicating the race.
+           */
           #define _GNU_SOURCE
+          #include <errno.h>
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
@@ -33,7 +48,10 @@ jobs:
           #include <sys/user.h>
           #include <sys/wait.h>
           #include <unistd.h>
-          #include <errno.h>
+
+          #ifndef SYS_inotify_add_watch
+          #define SYS_inotify_add_watch 254
+          #endif
 
           /* Read a NUL-terminated string from another process's address space */
           static void read_str(pid_t pid, unsigned long addr, char *buf, size_t len) {
@@ -90,21 +108,23 @@ jobs:
                       ptrace(PTRACE_GETEVENTMSG, pid, NULL, &npid);
                       ptrace(PTRACE_SYSCALL, (pid_t)npid, NULL, NULL);
                   } else if (sig == (SIGTRAP | 0x80)) {
-                      /* syscall entry or exit */
+                      /* syscall entry or exit — entry is identified by the
+                         kernel sentinel rax == -ENOSYS set before dispatch */
                       struct user_regs_struct r;
                       ptrace(PTRACE_GETREGS, pid, NULL, &r);
-                      /* Delay every thread that opens the docs dir, but only
-                         on syscall entry (rax == -ENOSYS is the kernel's
-                         sentinel value set before the syscall dispatches). */
-                      if ((long long)r.orig_rax == SYS_openat &&
-                          r.rax == (unsigned long long)-ENOSYS) {
+                      if ((long long)r.orig_rax == SYS_inotify_add_watch &&
+                          r.rax == (unsigned long long)(long long)-ENOSYS) {
+                          /* inotify_add_watch(fd, pathname, mask):
+                             pathname is the second argument → rsi */
                           char path[4096] = "";
                           read_str(pid, r.rsi, path, sizeof path);
                           if (!strcmp(path, target)) {
                               fprintf(stderr,
-                                  "[inject_delay] %ds delay (tid %d)\n", secs, (int)pid);
+                                  "[inject_delay] %ds delay on inotify_add_watch"
+                                  " (tid %d)\n", secs, (int)pid);
                               sleep(secs);
-                              fprintf(stderr, "[inject_delay] done (tid %d)\n", (int)pid);
+                              fprintf(stderr, "[inject_delay] done (tid %d)\n",
+                                  (int)pid);
                           }
                       }
                   } else if (sig != SIGTRAP) {
