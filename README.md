@@ -4,8 +4,10 @@ Minimal reproduction for [zensical/zensical#726](https://github.com/zensical/zen
 fixed in [zensical/zensical#727](https://github.com/zensical/zensical/pull/727).
 
 The [CI action](../../actions) builds a patched zensical 0.0.43, runs it against
-this project, and asserts that `site/index.html` is generated — the assertion
-fails because the bug causes an empty `site/`.
+this project, and asserts that `site/index.html` is generated.  The assertion
+fails: the race causes either a `RuntimeError: Watcher disconnected` (the
+scheduler session closes while docs files are being inserted) or a silent empty
+`site/` depending on timing.
 
 ## Root cause
 
@@ -38,9 +40,17 @@ On a fast (≥8-core) machine this fails reliably.  On a slower machine apply
 the patch manually:
 
 ```sh
+# Note: python/zensical/templates/ is not committed to git (it is a build
+# artifact).  Install the PyPI wheel for its theme assets, then swap in the
+# patched .so built from source.
 git clone https://github.com/zensical/zensical --branch v0.0.43 zensical-src
 patch -p1 -d zensical-src < race.patch
-cargo build --release --manifest-path zensical-src/Cargo.toml
-./zensical-src/target/release/zensical build
-# site/ is empty — bug reproduced
+cd zensical-src && maturin build --release --out dist && cd ..
+python3 -m venv zenv && zenv/bin/pip install "zensical==0.0.43"
+so=$(unzip -l zensical-src/dist/zensical-*.whl | tail -n +4 | head -n -2 \
+  | awk '{print $NF}' | grep '\.so$')
+site_dir=$(zenv/bin/python3 -c "import site; print(site.getsitepackages()[0])")
+unzip -p zensical-src/dist/zensical-*.whl "$so" > "$site_dir/$so"
+zenv/bin/zensical build
+# RuntimeError: Watcher disconnected  (or silent empty site/) — bug reproduced
 ```

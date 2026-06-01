@@ -28,10 +28,10 @@ jobs:
         run: uvx maturin build --release --out dist
         working-directory: zensical-src
 
-      - name: Build site
+      - name: Install zensical with patched extension
         run: |
-          # Install official 0.0.43 from PyPI — it has the pre-built theme
-          # assets (templates/, .icons/, etc.) that are not in the git tree.
+          # Install official 0.0.43 from PyPI: it carries the pre-built theme
+          # assets (templates/, .icons/, etc.) that are not committed to git.
           python3 -m venv /tmp/zenv
           /tmp/zenv/bin/pip install --quiet "zensical==0.0.43"
 
@@ -43,10 +43,12 @@ jobs:
             -c "import site; print(site.getsitepackages()[0])")
           so=$(unzip -l "$patched_wheel" | tail -n +4 | head -n -2 \
             | awk '{print $NF}' | grep '\.so$')
-          echo "Replacing $so"
           unzip -p "$patched_wheel" "$so" > "$site_dir/$so"
 
-          /tmp/zenv/bin/zensical build
+      - name: Build site
+        # The race causes either RuntimeError (Watcher disconnected) or a
+        # silent empty site/; allow both so the assertion step always runs.
+        run: /tmp/zenv/bin/zensical build || true
 
       - name: Assert site/index.html was generated
         run: |
