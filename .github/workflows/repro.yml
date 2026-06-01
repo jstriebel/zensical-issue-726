@@ -56,3 +56,52 @@ jobs:
           find site -type f | sort
           test -f site/index.html || \
             (echo "FAIL: site/index.html missing — bug reproduced" && exit 1)
+
+  build-with-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone zensical fix branch
+        run: |
+          git clone https://github.com/jstriebel/zensical \
+            --branch fix/watch-docs-dir-first --depth 1 zensical-src
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: zensical-src
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build fixed wheel
+        run: uvx maturin build --release --out dist
+        working-directory: zensical-src
+
+      - name: Install zensical with fixed extension
+        run: |
+          # Install official 0.0.43 from PyPI: it carries the pre-built theme
+          # assets (templates/, .icons/, etc.) that are not committed to git.
+          python3 -m venv /tmp/zenv
+          /tmp/zenv/bin/pip install --quiet "zensical==0.0.43"
+
+          # Hot-swap the compiled extension (.so) with our fixed build.
+          # The fix only touches Rust; all Python and theme files stay
+          # as shipped by PyPI.
+          fixed_wheel=$(ls zensical-src/dist/zensical-*.whl)
+          site_dir=$(/tmp/zenv/bin/python3 \
+            -c "import site; print(site.getsitepackages()[0])")
+          so=$(unzip -l "$fixed_wheel" | tail -n +4 | head -n -2 \
+            | awk '{print $NF}' | grep '\.so$')
+          unzip -p "$fixed_wheel" "$so" > "$site_dir/$so"
+
+      - name: Build site
+        run: /tmp/zenv/bin/zensical build
+
+      - name: Assert site/index.html was generated
+        run: |
+          echo "site/ contents:"
+          find site -type f | sort
+          test -f site/index.html || \
+            (echo "FAIL: site/index.html missing — fix did not work" && exit 1)
