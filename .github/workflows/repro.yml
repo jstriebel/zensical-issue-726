@@ -31,7 +31,11 @@ jobs:
       - name: Build site
         run: |
           wheel=$(ls zensical-src/dist/zensical-*.whl)
-          uvx --from "$wheel" zensical build
+          echo "=== wheel top-level dirs ==="
+          unzip -l "$wheel" | awk '{print $NF}' | grep '/' | sed 's|/.*||' | sort -u
+          python3 -m venv /tmp/zenv
+          /tmp/zenv/bin/pip install --quiet "$wheel"
+          /tmp/zenv/bin/zensical build
 
       - name: Assert site/index.html was generated
         run: |
