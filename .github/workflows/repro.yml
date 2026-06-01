@@ -20,16 +20,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "zensical-src -> zensical-src/target"
+          workspaces: zensical-src
 
-      - name: Build patched zensical
-        run: |
-          cargo build --release --target-dir target
-          find target/release -maxdepth 1 -type f | sort
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build patched wheel
+        run: uvx maturin build --release --out dist
         working-directory: zensical-src
 
       - name: Build site
-        run: ./zensical-src/target/release/zensical build
+        run: |
+          wheel=$(ls zensical-src/dist/zensical-*.whl)
+          uvx --from "$wheel" zensical build
 
       - name: Assert site/index.html was generated
         run: |
