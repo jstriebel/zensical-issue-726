@@ -10,13 +10,60 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - name: Pre-populate site/ to delay docs scan
+      - name: Build docs-delay shim
         run: |
-          mkdir -p site
-          python3 -c "[open('site/dummy_%06d.html' % i, 'w').write('x') for i in range(10000)]"
+          cat > /tmp/delay_docs.c << 'EOF'
+          /* Intercept openat() and sleep 2s the first time the agent opens the
+             docs directory.  This ensures the scheduler's idle timeout fires
+             before any markdown file is inserted, deterministically reproducing
+             the race in zensical 0.0.43 (docs dir watched last). */
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <stdarg.h>
+          #include <string.h>
+          #include <time.h>
 
-      - name: Build site
-        run: uvx zensical==0.0.43 build
+          static int fired;
+
+          static void delay_if_docs(const char *path) {
+              if (!path || fired) return;
+              const char *sl = strrchr(path, '/');
+              if (strcmp(sl ? sl + 1 : path, "docs") == 0) {
+                  fired = 1;
+                  struct timespec ts = {2, 0};
+                  nanosleep(&ts, NULL);
+              }
+          }
+
+          int openat(int dfd, const char *path, int flags, ...) {
+              static int (*real)(int, const char *, int, ...);
+              if (!real) real = dlsym(RTLD_NEXT, "openat");
+              delay_if_docs(path);
+              if (flags & O_CREAT) {
+                  va_list ap; va_start(ap, flags);
+                  mode_t m = va_arg(ap, mode_t); va_end(ap);
+                  return real(dfd, path, flags, m);
+              }
+              return real(dfd, path, flags);
+          }
+
+          int open(const char *path, int flags, ...) {
+              static int (*real)(const char *, int, ...);
+              if (!real) real = dlsym(RTLD_NEXT, "open");
+              delay_if_docs(path);
+              if (flags & O_CREAT) {
+                  va_list ap; va_start(ap, flags);
+                  mode_t m = va_arg(ap, mode_t); va_end(ap);
+                  return real(path, flags, m);
+              }
+              return real(path, flags);
+          }
+          EOF
+          gcc -shared -fPIC -o /tmp/delay_docs.so /tmp/delay_docs.c -ldl
+
+      - name: Build site (docs scan delayed via LD_PRELOAD)
+        run: LD_PRELOAD=/tmp/delay_docs.so uvx zensical==0.0.43 build
 
       - name: Assert site/index.html was generated
         run: |
