@@ -1,0 +1,17 @@
+name: System info
+
+on: [push]
+
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: astral-sh/setup-uv@v5
+      - run: nproc && uname -r && python3 --version && uvx python3 --version
+      - run: |
+          uvx --from zensical==0.0.43 python3 -c "
+          import zensical, os, sys
+          pkg = os.path.dirname(zensical.__file__)
+          print('python:', sys.version)
+          print('has templates:', os.path.isdir(os.path.join(pkg, 'templates')))
+          "
