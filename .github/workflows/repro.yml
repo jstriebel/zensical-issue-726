@@ -23,7 +23,9 @@ jobs:
           workspaces: "zensical-src -> zensical-src/target"
 
       - name: Build patched zensical
-        run: cargo build --release --target-dir target
+        run: |
+          cargo build --release --target-dir target
+          find target/release -maxdepth 1 -type f | sort
         working-directory: zensical-src
 
       - name: Build site
