@@ -1,0 +1,3 @@
+[project]
+site_name = "Repro"
+docs_dir  = "docs"

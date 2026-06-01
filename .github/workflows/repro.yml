@@ -1,0 +1,20 @@
+name: Reproduce zensical/zensical#726
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build site
+        run: uvx zensical==0.0.43 build
+
+      - name: Assert site/index.html was generated
+        run: |
+          echo "site/ contents:"
+          find site -type f | sort
+          test -f site/index.html || (echo "FAIL: site/index.html missing — bug reproduced" && exit 1)
