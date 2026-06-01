@@ -13,54 +13,91 @@ jobs:
       - name: Build docs-delay shim
         run: |
           cat > /tmp/delay_docs.c << 'EOF'
-          /* Intercept openat() and sleep 2s the first time the agent opens the
-             docs directory.  This ensures the scheduler's idle timeout fires
-             before any markdown file is inserted, deterministically reproducing
-             the race in zensical 0.0.43 (docs dir watched last). */
+          /*
+           * Intercept file-open calls and sleep 2 s the first time the process
+           * opens the docs/ directory of the current project.  This widens the
+           * race window in zensical 0.0.43 (docs dir watched last) enough to
+           * guarantee the scheduler idle-timeout fires before any markdown file
+           * is inserted, so site/index.html is never generated.
+           *
+           * Uses the absolute CWD/docs path (set in the constructor) so that
+           * opens of unrelated "docs" dirs during uvx package installation do
+           * not trigger the delay prematurely.
+           */
           #define _GNU_SOURCE
           #include <dlfcn.h>
+          #include <dirent.h>
           #include <fcntl.h>
           #include <stdarg.h>
+          #include <stdio.h>
           #include <string.h>
           #include <time.h>
+          #include <unistd.h>
 
-          static int fired;
+          static int  fired;
+          static char target[4096];
 
-          static void delay_if_docs(const char *path) {
-              if (!path || fired) return;
-              const char *sl = strrchr(path, '/');
-              if (strcmp(sl ? sl + 1 : path, "docs") == 0) {
+          __attribute__((constructor)) static void init(void) {
+              char cwd[4096];
+              if (getcwd(cwd, sizeof(cwd)))
+                  snprintf(target, sizeof(target), "%s/docs", cwd);
+              fprintf(stderr, "[delay_docs] armed for: %s\n", target);
+          }
+
+          static void maybe_delay(const char *path) {
+              if (!path || fired || !target[0]) return;
+              if (strcmp(path, target) == 0) {
                   fired = 1;
+                  fprintf(stderr, "[delay_docs] 2s delay before docs scan\n");
                   struct timespec ts = {2, 0};
                   nanosleep(&ts, NULL);
+                  fprintf(stderr, "[delay_docs] delay done\n");
               }
           }
 
-          int openat(int dfd, const char *path, int flags, ...) {
-              static int (*real)(int, const char *, int, ...);
-              if (!real) real = dlsym(RTLD_NEXT, "openat");
-              delay_if_docs(path);
-              if (flags & O_CREAT) {
-                  va_list ap; va_start(ap, flags);
-                  mode_t m = va_arg(ap, mode_t); va_end(ap);
-                  return real(dfd, path, flags, m);
-              }
-              return real(dfd, path, flags);
+          int openat(int dfd, const char *p, int fl, ...) {
+              static int (*r)(int, const char *, int, ...);
+              if (!r) r = dlsym(RTLD_NEXT, "openat");
+              maybe_delay(p);
+              if (fl & O_CREAT) { va_list a; va_start(a,fl); mode_t m=va_arg(a,mode_t); va_end(a); return r(dfd,p,fl,m); }
+              return r(dfd,p,fl);
           }
 
-          int open(const char *path, int flags, ...) {
-              static int (*real)(const char *, int, ...);
-              if (!real) real = dlsym(RTLD_NEXT, "open");
-              delay_if_docs(path);
-              if (flags & O_CREAT) {
-                  va_list ap; va_start(ap, flags);
-                  mode_t m = va_arg(ap, mode_t); va_end(ap);
-                  return real(path, flags, m);
-              }
-              return real(path, flags);
+          int openat64(int dfd, const char *p, int fl, ...) {
+              static int (*r)(int, const char *, int, ...);
+              if (!r) r = dlsym(RTLD_NEXT, "openat64");
+              if (!r) r = dlsym(RTLD_NEXT, "openat");
+              maybe_delay(p);
+              if (fl & O_CREAT) { va_list a; va_start(a,fl); mode_t m=va_arg(a,mode_t); va_end(a); return r(dfd,p,fl,m); }
+              return r(dfd,p,fl);
+          }
+
+          int open(const char *p, int fl, ...) {
+              static int (*r)(const char *, int, ...);
+              if (!r) r = dlsym(RTLD_NEXT, "open");
+              maybe_delay(p);
+              if (fl & O_CREAT) { va_list a; va_start(a,fl); mode_t m=va_arg(a,mode_t); va_end(a); return r(p,fl,m); }
+              return r(p,fl);
+          }
+
+          int open64(const char *p, int fl, ...) {
+              static int (*r)(const char *, int, ...);
+              if (!r) r = dlsym(RTLD_NEXT, "open64");
+              if (!r) r = dlsym(RTLD_NEXT, "open");
+              maybe_delay(p);
+              if (fl & O_CREAT) { va_list a; va_start(a,fl); mode_t m=va_arg(a,mode_t); va_end(a); return r(p,fl,m); }
+              return r(p,fl);
+          }
+
+          DIR *opendir(const char *p) {
+              static DIR *(*r)(const char *);
+              if (!r) r = dlsym(RTLD_NEXT, "opendir");
+              maybe_delay(p);
+              return r(p);
           }
           EOF
           gcc -shared -fPIC -o /tmp/delay_docs.so /tmp/delay_docs.c -ldl
+          echo "shim compiled OK"
 
       - name: Build site (docs scan delayed via LD_PRELOAD)
         run: LD_PRELOAD=/tmp/delay_docs.so uvx zensical==0.0.43 build
