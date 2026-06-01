@@ -10,8 +10,10 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - name: Generate dummy files to widen race window
-        run: python3 -c "[open('dummy_%06d.txt' % i, 'w').write('x') for i in range(50000)]"
+      - name: Pre-populate site/ to delay docs scan
+        run: |
+          mkdir -p site
+          python3 -c "[open('site/dummy_%06d.html' % i, 'w').write('x') for i in range(10000)]"
 
       - name: Build site
         run: uvx zensical==0.0.43 build
