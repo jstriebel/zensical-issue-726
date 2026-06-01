@@ -10,10 +10,14 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      - name: Generate dummy files to widen race window
+        run: python3 -c "
+for i in range(50_000):
+    open(f'dummy_{i:06d}.txt', 'w').write('x')
+"
+
       - name: Build site
-        # Pin to single core so build and agent threads must time-share,
-        # increasing the chance the race window opens before docs are scanned.
-        run: taskset -c 0 uvx zensical==0.0.43 build
+        run: uvx zensical==0.0.43 build
 
       - name: Assert site/index.html was generated
         run: |
