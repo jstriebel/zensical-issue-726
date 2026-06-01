@@ -10,96 +10,114 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - name: Trace openat syscalls for docs dir
+      - name: Build ptrace delay injector
         run: |
-          strace -f -e trace=openat -o /tmp/strace.txt \
-            uvx zensical==0.0.43 build 2>/dev/null || true
-          echo "=== openat calls mentioning 'docs' ==="
-          grep '".*docs' /tmp/strace.txt | head -20 || echo "(none)"
-
-      - name: Build docs-delay shim (log all docs-related opens)
-        run: |
-          cat > /tmp/delay_docs.c << 'EOF'
+          cat > /tmp/inject_delay.c << 'EOF'
+          /*
+           * inject_delay: fork a child, trace it with ptrace, and sleep
+           * <secs> seconds the first time it makes an openat(2) syscall
+           * with <path> as the filename argument.
+           *
+           * Usage: inject_delay <path> <secs> <cmd> [args...]
+           *
+           * Rust (via rustix) calls openat2 as a raw syscall, bypassing
+           * glibc, so LD_PRELOAD cannot intercept it.  ptrace works at
+           * the kernel boundary and catches raw syscalls too.
+           */
           #define _GNU_SOURCE
-          #include <dlfcn.h>
-          #include <dirent.h>
-          #include <fcntl.h>
-          #include <stdarg.h>
           #include <stdio.h>
+          #include <stdlib.h>
           #include <string.h>
-          #include <time.h>
+          #include <sys/ptrace.h>
+          #include <sys/syscall.h>
+          #include <sys/user.h>
+          #include <sys/wait.h>
           #include <unistd.h>
 
-          static int  fired;
-          static char target[4096];
+          static int fired;
 
-          __attribute__((constructor)) static void init(void) {
-              char cwd[4096];
-              if (getcwd(cwd, sizeof(cwd)))
-                  snprintf(target, sizeof(target), "%s/docs", cwd);
-              fprintf(stderr, "[delay_docs] armed for: %s\n", target);
-          }
-
-          static void maybe_delay(const char *path) {
-              if (!path || !target[0]) return;
-              /* log every open containing "docs" so we can see what paths arrive */
-              if (strstr(path, "docs"))
-                  fprintf(stderr, "[delay_docs] saw: %s (fired=%d)\n", path, fired);
-              if (!fired && strcmp(path, target) == 0) {
-                  fired = 1;
-                  fprintf(stderr, "[delay_docs] 2s delay before docs scan\n");
-                  struct timespec ts = {2, 0};
-                  nanosleep(&ts, NULL);
-                  fprintf(stderr, "[delay_docs] delay done\n");
+          /* Read a NUL-terminated string from another process's address space */
+          static void read_str(pid_t pid, unsigned long addr, char *buf, size_t len) {
+              union { long v; char b[sizeof(long)]; } u;
+              for (size_t i = 0; i < len - 1; i += sizeof(long)) {
+                  u.v = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr + i), NULL);
+                  for (size_t j = 0; j < sizeof(long) && i + j < len - 1; j++) {
+                      buf[i + j] = u.b[j];
+                      if (!u.b[j]) return;
+                  }
               }
+              buf[len - 1] = '\0';
           }
 
-          int openat(int dfd, const char *p, int fl, ...) {
-              static int (*r)(int, const char *, int, ...);
-              if (!r) r = dlsym(RTLD_NEXT, "openat");
-              maybe_delay(p);
-              if (fl & O_CREAT) { va_list a; va_start(a,fl); mode_t m=va_arg(a,mode_t); va_end(a); return r(dfd,p,fl,m); }
-              return r(dfd,p,fl);
-          }
+          int main(int argc, char **argv) {
+              if (argc < 4) {
+                  fprintf(stderr, "usage: %s path secs cmd [args...]\n", argv[0]);
+                  return 1;
+              }
+              const char *target = argv[1];
+              int secs = atoi(argv[2]);
 
-          int openat64(int dfd, const char *p, int fl, ...) {
-              static int (*r)(int, const char *, int, ...);
-              if (!r) r = dlsym(RTLD_NEXT, "openat64");
-              if (!r) r = dlsym(RTLD_NEXT, "openat");
-              maybe_delay(p);
-              if (fl & O_CREAT) { va_list a; va_start(a,fl); mode_t m=va_arg(a,mode_t); va_end(a); return r(dfd,p,fl,m); }
-              return r(dfd,p,fl);
-          }
+              pid_t root = fork();
+              if (root == 0) {
+                  ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+                  raise(SIGSTOP);
+                  execvp(argv[3], argv + 3);
+                  perror(argv[3]);
+                  _exit(127);
+              }
 
-          int open(const char *p, int fl, ...) {
-              static int (*r)(const char *, int, ...);
-              if (!r) r = dlsym(RTLD_NEXT, "open");
-              maybe_delay(p);
-              if (fl & O_CREAT) { va_list a; va_start(a,fl); mode_t m=va_arg(a,mode_t); va_end(a); return r(p,fl,m); }
-              return r(p,fl);
-          }
+              int st;
+              waitpid(root, &st, 0);
+              ptrace(PTRACE_SETOPTIONS, root, NULL,
+                     PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE |
+                     PTRACE_O_TRACEFORK   | PTRACE_O_TRACEVFORK);
+              ptrace(PTRACE_SYSCALL, root, NULL, NULL);
 
-          int open64(const char *p, int fl, ...) {
-              static int (*r)(const char *, int, ...);
-              if (!r) r = dlsym(RTLD_NEXT, "open64");
-              if (!r) r = dlsym(RTLD_NEXT, "open");
-              maybe_delay(p);
-              if (fl & O_CREAT) { va_list a; va_start(a,fl); mode_t m=va_arg(a,mode_t); va_end(a); return r(p,fl,m); }
-              return r(p,fl);
-          }
+              for (;;) {
+                  pid_t pid = waitpid(-1, &st, __WALL);
+                  if (pid < 0) break;
+                  if (WIFEXITED(st)   && pid == root) return WEXITSTATUS(st);
+                  if (WIFSIGNALED(st) && pid == root) return 128 + WTERMSIG(st);
+                  if (!WIFSTOPPED(st)) continue;
 
-          DIR *opendir(const char *p) {
-              static DIR *(*r)(const char *);
-              if (!r) r = dlsym(RTLD_NEXT, "opendir");
-              maybe_delay(p);
-              return r(p);
+                  int sig = WSTOPSIG(st), fwd = 0;
+                  int ev  = st >> 16;
+
+                  if (ev == PTRACE_EVENT_FORK  ||
+                      ev == PTRACE_EVENT_VFORK ||
+                      ev == PTRACE_EVENT_CLONE) {
+                      /* resume new child from its initial ptrace-stop */
+                      unsigned long npid;
+                      ptrace(PTRACE_GETEVENTMSG, pid, NULL, &npid);
+                      ptrace(PTRACE_SYSCALL, (pid_t)npid, NULL, NULL);
+                  } else if (sig == (SIGTRAP | 0x80)) {
+                      /* syscall entry or exit */
+                      struct user_regs_struct r;
+                      ptrace(PTRACE_GETREGS, pid, NULL, &r);
+                      if (!fired && (long long)r.orig_rax == SYS_openat) {
+                          char path[4096] = "";
+                          read_str(pid, r.rsi, path, sizeof path);
+                          if (!strcmp(path, target)) {
+                              fired = 1;
+                              fprintf(stderr,
+                                  "[inject_delay] %ds delay before docs scan\n", secs);
+                              sleep(secs);
+                              fprintf(stderr, "[inject_delay] delay done\n");
+                          }
+                      }
+                  } else if (sig != SIGTRAP) {
+                      fwd = sig;   /* pass real signals through to the tracee */
+                  }
+                  ptrace(PTRACE_SYSCALL, pid, NULL, (void *)(long)fwd);
+              }
+              return 0;
           }
           EOF
-          gcc -shared -fPIC -o /tmp/delay_docs.so /tmp/delay_docs.c -ldl
-          echo "shim compiled OK"
+          gcc -o /tmp/inject_delay /tmp/inject_delay.c
+          echo "injector compiled OK"
 
-      - name: Build site (docs scan delayed via LD_PRELOAD)
-        run: LD_PRELOAD=/tmp/delay_docs.so uvx zensical==0.0.43 build
+      - name: Build site (docs scan delayed via ptrace injector)
+        run: /tmp/inject_delay "$(pwd)/docs" 2 uvx zensical==0.0.43 build
 
       - name: Assert site/index.html was generated
         run: |
