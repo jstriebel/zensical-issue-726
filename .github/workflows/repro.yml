@@ -11,7 +11,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
 
       - name: Build site
-        run: uvx zensical==0.0.43 build
+        # Pin to single core so build and agent threads must time-share,
+        # increasing the chance the race window opens before docs are scanned.
+        run: taskset -c 0 uvx zensical==0.0.43 build
 
       - name: Assert site/index.html was generated
         run: |
